@@ -524,6 +524,74 @@ export async function runEmbeddedPiAgent(
             throw promptError;
           }
 
+          // ── Context overflow from lastAssistant.errorMessage ──
+          // The streaming library may handle API errors internally (e.g., 400 context limit)
+          // and store them as an error assistant message WITHOUT throwing promptError.
+          // Detect this case and trigger auto-compaction.
+          if (
+            !promptError &&
+            !aborted &&
+            lastAssistant?.errorMessage &&
+            isContextOverflowError(lastAssistant.errorMessage)
+          ) {
+            const isCompactionFailure = isCompactionFailureError(lastAssistant.errorMessage);
+            if (!isCompactionFailure && !overflowCompactionAttempted) {
+              log.warn(
+                `context overflow detected (from assistant error); attempting auto-compaction for ${provider}/${modelId}`,
+              );
+              overflowCompactionAttempted = true;
+              const compactResult = await compactEmbeddedPiSessionDirect({
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+                messageChannel: params.messageChannel,
+                messageProvider: params.messageProvider,
+                agentAccountId: params.agentAccountId,
+                authProfileId: lastProfileId,
+                sessionFile: params.sessionFile,
+                workspaceDir: params.workspaceDir,
+                agentDir,
+                config: params.config,
+                skillsSnapshot: params.skillsSnapshot,
+                senderIsOwner: params.senderIsOwner,
+                provider,
+                model: modelId,
+                thinkLevel,
+                reasoningLevel: params.reasoningLevel,
+                bashElevated: params.bashElevated,
+                extraSystemPrompt: params.extraSystemPrompt,
+                ownerNumbers: params.ownerNumbers,
+              });
+              if (compactResult.compacted) {
+                log.info(`auto-compaction succeeded for ${provider}/${modelId}; retrying prompt`);
+                continue;
+              }
+              log.warn(
+                `auto-compaction failed for ${provider}/${modelId}: ${compactResult.reason ?? "nothing to compact"}`,
+              );
+            }
+            const kind = isCompactionFailure ? "compaction_failure" : "context_overflow";
+            return {
+              payloads: [
+                {
+                  text:
+                    "Context overflow: prompt too large for the model. " +
+                    "Try again with less input or a larger-context model.",
+                  isError: true,
+                },
+              ],
+              meta: {
+                durationMs: Date.now() - started,
+                agentMeta: {
+                  sessionId: sessionIdUsed,
+                  provider,
+                  model: model.id,
+                },
+                systemPromptReport: attempt.systemPromptReport,
+                error: { kind, message: lastAssistant.errorMessage },
+              },
+            };
+          }
+
           const fallbackThinking = pickFallbackThinkingLevel({
             message: lastAssistant?.errorMessage,
             attempted: attemptedThinking,

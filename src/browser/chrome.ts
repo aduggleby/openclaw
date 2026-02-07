@@ -235,7 +235,7 @@ async function setupBrowserLevelProxyAuth(
     ws.addEventListener("error", () => resolve());
     // Don't close the WebSocket - it needs to stay alive for ongoing auth events
     // Timeout resolve after 5s in case of issues
-    setTimeout(resolve, 5000);
+    setTimeout(resolve, 1500);
   });
 }
 
@@ -397,14 +397,11 @@ export async function launchOpenClawChrome(
     `🦞 openclaw browser started (${exe.kind}) profile "${profile.name}" on 127.0.0.1:${profile.cdpPort} (pid ${pid})`,
   );
 
-  // Set up browser-level proxy auth before any pages navigate
+  // Set up browser-level proxy auth (non-blocking to avoid delaying launch)
   if (resolved.proxy?.username) {
-    try {
-      await setupBrowserLevelProxyAuth(profile.cdpPort, resolved.proxy);
-      log.info("🦞 browser-level proxy auth configured");
-    } catch {
-      log.warn("browser-level proxy auth setup failed (non-critical)");
-    }
+    setupBrowserLevelProxyAuth(profile.cdpPort, resolved.proxy)
+      .then(() => log.info("🦞 browser-level proxy auth configured"))
+      .catch(() => log.warn("browser-level proxy auth setup failed (non-critical)"));
   }
 
   return {

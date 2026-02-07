@@ -194,6 +194,13 @@ export async function ensureLoaded(state: CronServiceState, opts?: { forceReload
         }
         mutated = true;
       }
+      // Migrate: pin anchorMs for "every" schedules that lack one.
+      // Without a stable anchor, recomputeNextRuns resets nextRunAtMs to now+everyMs
+      // on every reload, preventing the job from ever being due.
+      if (sched.kind === "every" && sched.anchorMs === undefined) {
+        sched.anchorMs = typeof raw.createdAtMs === "number" ? raw.createdAtMs : 0;
+        mutated = true;
+      }
     }
 
     const delivery = raw.delivery;

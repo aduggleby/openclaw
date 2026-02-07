@@ -28,6 +28,7 @@ export type ResolvedBrowserConfig = {
   headless: boolean;
   noSandbox: boolean;
   attachOnly: boolean;
+  proxy?: { url: string; username?: string; password?: string };
   defaultProfile: string;
   profiles: Record<string, BrowserProfileConfig>;
 };
@@ -192,6 +193,10 @@ export function resolveBrowserConfig(
   const headless = cfg?.headless === true;
   const noSandbox = cfg?.noSandbox === true;
   const attachOnly = cfg?.attachOnly === true;
+  const rawProxy = cfg?.proxy && typeof cfg.proxy === "object" ? cfg.proxy as Record<string, unknown> : null;
+  const proxy = rawProxy?.url && typeof rawProxy.url === "string"
+    ? { url: rawProxy.url.trim(), username: typeof rawProxy.username === "string" ? rawProxy.username : undefined, password: typeof rawProxy.password === "string" ? rawProxy.password : undefined }
+    : undefined;
   const executablePath = cfg?.executablePath?.trim() || undefined;
 
   const defaultProfileFromConfig = cfg?.defaultProfile?.trim() || undefined;
@@ -222,6 +227,7 @@ export function resolveBrowserConfig(
     headless,
     noSandbox,
     attachOnly,
+    proxy,
     defaultProfile,
     profiles,
   };

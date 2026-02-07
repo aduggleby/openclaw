@@ -80,6 +80,14 @@ export function recomputeNextRuns(state: CronServiceState) {
       );
       job.state.runningAtMs = undefined;
     }
+    // Preserve nextRunAtMs for jobs that are already due (now >= nextRunAtMs).
+    // Without this guard, recomputeNextRuns (called on every forceReload in
+    // ensureLoaded) advances nextRunAtMs to the next future grid point, which
+    // prevents runDueJobs from ever seeing the job as due.
+    const existingNext = job.state.nextRunAtMs;
+    if (typeof existingNext === "number" && now >= existingNext) {
+      continue;
+    }
     job.state.nextRunAtMs = computeJobNextRunAtMs(job, now);
   }
 }
@@ -124,6 +132,12 @@ export function createJob(state: CronServiceState, input: CronJobCreate): CronJo
       ...input.state,
     },
   };
+  // Pin anchorMs for "every" schedules to prevent recomputeNextRuns drift.
+  // Without a stable anchor, each recompute resets nextRunAtMs to now+everyMs,
+  // meaning the job is never due when the timer fires.
+  if (job.schedule.kind === "every" && job.schedule.anchorMs === undefined) {
+    job.schedule.anchorMs = now;
+  }
   assertSupportedJobSpec(job);
   assertDeliverySupport(job);
   job.state.nextRunAtMs = computeJobNextRunAtMs(job, now);

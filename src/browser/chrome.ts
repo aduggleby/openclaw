@@ -199,7 +199,23 @@ export async function launchOpenClawChrome(
       "--disable-session-crashed-bubble",
       "--hide-crash-restore-bubble",
       "--password-store=basic",
+
+      // ── Stealth / anti-bot-detection flags ──
+      // Disable the navigator.webdriver flag that CDP normally sets.
+      "--disable-blink-features=AutomationControlled",
+      // Suppress the automation infobar.
+      "--disable-infobars",
+      // Use a normal-looking window size.
+      "--window-size=1920,1080",
+      // Disable automation extension to avoid automation-related Chrome flags.
+      "--disable-extensions-except=",
+      "--disable-default-apps",
     ];
+
+    // ── Proxy configuration ──
+    if (resolved.proxy?.url) {
+      args.push(`--proxy-server=${resolved.proxy.url}`);
+    }
 
     if (resolved.headless) {
       // Best-effort; older Chromes may ignore.

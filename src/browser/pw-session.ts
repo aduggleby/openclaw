@@ -11,6 +11,8 @@ import { formatErrorMessage } from "../infra/errors.js";
 import { getHeadersWithAuth } from "./cdp.helpers.js";
 import { getChromeWebSocketUrl } from "./chrome.js";
 
+import { loadConfig } from "../config/config.js";
+import { resolveBrowserConfig } from "./config.js";
 export type BrowserConsoleMessage = {
   type: string;
   text: string;
@@ -286,12 +288,63 @@ export function ensurePageState(page: Page): PageState {
   return state;
 }
 
+
+// ── Stealth init script ──
+// Injected into every browser context to hide automation markers.
+const STEALTH_INIT_SCRIPT = `
+  // 1. Remove navigator.webdriver
+  Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+
+  // 2. Override navigator.plugins to look like a real browser
+  Object.defineProperty(navigator, "plugins", {
+    get: () => {
+      const p = [
+        { name: "Chrome PDF Plugin", filename: "internal-pdf-viewer", description: "Portable Document Format" },
+        { name: "Chrome PDF Viewer", filename: "mhjfbmdgcfjbbpaeojofohoefgiehjai", description: "" },
+        { name: "Native Client", filename: "internal-nacl-plugin", description: "" },
+      ];
+      p.refresh = () => {};
+      return p;
+    },
+  });
+
+  // 3. Override navigator.languages
+  Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+
+  // 4. Fix chrome.runtime to look normal (not automated)
+  if (!window.chrome) { window.chrome = {}; }
+  if (!window.chrome.runtime) {
+    window.chrome.runtime = {
+      connect: () => {},
+      sendMessage: () => {},
+      onMessage: { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
+    };
+  }
+
+  // 5. Spoof permissions query for notifications
+  if (navigator.permissions) {
+    const originalQuery = navigator.permissions.query;
+    navigator.permissions.query = (parameters) => (
+      parameters.name === "notifications"
+        ? Promise.resolve({ state: Notification.permission })
+        : originalQuery.call(navigator.permissions, parameters)
+    );
+  }
+
+  // 6. Remove Playwright/CDP-specific properties
+  delete window.__playwright;
+  delete window.__pw_manual;
+`;
+
 function observeContext(context: BrowserContext) {
   if (observedContexts.has(context)) {
     return;
   }
   observedContexts.add(context);
   ensureContextState(context);
+
+  // Inject stealth scripts to hide automation markers from bot detectors.
+  context.addInitScript(STEALTH_INIT_SCRIPT).catch(() => {});
 
   for (const page of context.pages()) {
     ensurePageState(page);
@@ -312,6 +365,99 @@ export function ensureContextState(context: BrowserContext): ContextState {
 function observeBrowser(browser: Browser) {
   for (const context of browser.contexts()) {
     observeContext(context);
+  }
+}
+
+
+
+// ── Proxy authentication via CDP ──
+// When a proxy requires authentication, Chrome triggers Fetch.authRequired.
+// We intercept it and provide credentials from the browser config.
+async function setupProxyAuth(browser: Browser, proxy: { url: string; username?: string; password?: string }): Promise<void> {
+  if (!proxy.username) return;
+  try {
+    for (const context of browser.contexts()) {
+      for (const page of context.pages()) {
+        try {
+          const cdpSession = await page.context().newCDPSession(page);
+          await cdpSession.send("Fetch.enable", {
+            handleAuthRequests: true,
+            patterns: [{ requestStage: "Request" }, { requestStage: "Response" }],
+          });
+          cdpSession.on("Fetch.authRequired", async (event: Record<string, unknown>) => {
+            try {
+              await cdpSession.send("Fetch.continueWithAuth", {
+                requestId: event.requestId,
+                authChallengeResponse: {
+                  response: "ProvideCredentials",
+                  username: proxy.username,
+                  password: proxy.password || "",
+                },
+              });
+            } catch {
+              // Ignore auth failures
+            }
+          });
+          cdpSession.on("Fetch.requestPaused", async (event: Record<string, unknown>) => {
+            try {
+              await cdpSession.send("Fetch.continueRequest", {
+                requestId: event.requestId,
+              });
+            } catch {
+              // Ignore
+            }
+          });
+          // Don't detach - we need the session to stay alive for auth events
+        } catch {
+          // Ignore per-page errors
+        }
+      }
+    }
+  } catch {
+    // Non-critical
+  }
+}
+
+// ── CDP-level stealth ──
+// Uses Chrome DevTools Protocol directly to patch automation artifacts
+// that cannot be hidden via JavaScript alone.
+async function applyCdpStealth(browser: Browser): Promise<void> {
+  try {
+    for (const context of browser.contexts()) {
+      for (const page of context.pages()) {
+        try {
+          const cdpSession = await page.context().newCDPSession(page);
+          // Remove the "cdc_" driver property from the DOM
+          await cdpSession.send("Page.addScriptToEvaluateOnNewDocument", {
+            source: `
+              // Remove cdc_ properties that Chrome DevTools Protocol adds
+              const findAndDeleteCdc = () => {
+                for (const key of Object.keys(document)) {
+                  if (key.match(/^cdc_|^\$cdc_/)) {
+                    delete document[key];
+                  }
+                }
+              };
+              findAndDeleteCdc();
+              // Also run on mutations in case it gets re-added
+              const observer = new MutationObserver(findAndDeleteCdc);
+              observer.observe(document, { attributes: true, childList: true, subtree: true });
+            `,
+          });
+          // Set a realistic user-agent (strip "HeadlessChrome" if present)
+          await cdpSession.send("Network.setUserAgentOverride", {
+            userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+            acceptLanguage: "en-US,en;q=0.9",
+            platform: "Linux",
+          });
+          await cdpSession.detach().catch(() => {});
+        } catch {
+          // Ignore per-page errors (e.g. page already closed)
+        }
+      }
+    }
+  } catch {
+    // Non-critical: stealth is best-effort
   }
 }
 
@@ -336,6 +482,18 @@ async function connectBrowser(cdpUrl: string): Promise<ConnectedBrowser> {
         const connected: ConnectedBrowser = { browser, cdpUrl: normalized };
         cached = connected;
         observeBrowser(browser);
+        // Apply CDP-level stealth patches (user-agent, cdc_ removal).
+        await applyCdpStealth(browser);
+        // Set up proxy authentication if configured.
+        try {
+          const _cfg = loadConfig();
+          const _resolved = resolveBrowserConfig(_cfg.browser, _cfg);
+          if (_resolved.proxy?.username) {
+            await setupProxyAuth(browser, _resolved.proxy);
+          }
+        } catch {
+          // Non-critical: proxy auth setup is best-effort
+        }
         browser.on("disconnected", () => {
           if (cached?.browser === browser) {
             cached = null;

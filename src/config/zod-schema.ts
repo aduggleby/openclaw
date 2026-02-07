@@ -204,6 +204,14 @@ export const OpenClawSchema = z
         noSandbox: z.boolean().optional(),
         attachOnly: z.boolean().optional(),
         defaultProfile: z.string().optional(),
+        proxy: z
+          .object({
+            url: z.string(),
+            username: z.string().optional(),
+            password: z.string().optional(),
+          })
+          .strict()
+          .optional(),
         snapshotDefaults: BrowserSnapshotDefaultsSchema,
         profiles: z
           .record(

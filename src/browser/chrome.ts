@@ -371,6 +371,17 @@ export async function launchOpenClawChrome(
     log.warn(`openclaw browser clean-exit prefs failed: ${String(err)}`);
   }
 
+  // Remove stale Chrome singleton lock files from previous containers/processes.
+  // These prevent Chrome from starting when the user-data-dir is persisted across
+  // container restarts (the lock points to a dead hostname-PID pair).
+  for (const singleton of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) {
+    try {
+      fs.unlinkSync(path.join(userDataDir, singleton));
+    } catch {
+      // File may not exist; ignore.
+    }
+  }
+
   const proc = spawnOnce();
   // Wait for CDP to come up.
   const readyDeadline = Date.now() + 45_000;

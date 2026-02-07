@@ -51,6 +51,7 @@ import { resolveModel } from "./model.js";
 import { runEmbeddedAttempt } from "./run/attempt.js";
 import { buildEmbeddedRunPayloads } from "./run/payloads.js";
 import { describeUnknownError } from "./utils.js";
+import { emitAgentEvent } from "../../infra/agent-events.js";
 
 type ApiKeyInfo = ResolvedProviderAuth;
 
@@ -540,6 +541,11 @@ export async function runEmbeddedPiAgent(
                 `context overflow detected (from assistant error); attempting auto-compaction for ${provider}/${modelId}`,
               );
               overflowCompactionAttempted = true;
+              emitAgentEvent({
+                runId: params.runId,
+                stream: "compaction",
+                data: { phase: "start" },
+              });
               const compactResult = await compactEmbeddedPiSessionDirect({
                 sessionId: params.sessionId,
                 sessionKey: params.sessionKey,
@@ -563,11 +569,21 @@ export async function runEmbeddedPiAgent(
               });
               if (compactResult.compacted) {
                 log.info(`auto-compaction succeeded for ${provider}/${modelId}; retrying prompt`);
+                emitAgentEvent({
+                  runId: params.runId,
+                  stream: "compaction",
+                  data: { phase: "end", willRetry: true },
+                });
                 continue;
               }
               log.warn(
                 `auto-compaction failed for ${provider}/${modelId}: ${compactResult.reason ?? "nothing to compact"}`,
               );
+              emitAgentEvent({
+                runId: params.runId,
+                stream: "compaction",
+                data: { phase: "end", willRetry: false },
+              });
             }
             const kind = isCompactionFailure ? "compaction_failure" : "context_overflow";
             return {

@@ -336,6 +336,82 @@ const STEALTH_INIT_SCRIPT = `
   delete window.__pw_manual;
 `;
 
+
+// ── Per-page CDP setup ──
+// Applies stealth patches and proxy auth to each individual page.
+// Called for both existing pages and newly created pages.
+async function setupPageCdp(page: Page): Promise<void> {
+  try {
+    const cdpSession = await page.context().newCDPSession(page);
+
+    // ── CDP stealth: remove cdc_ properties ──
+    await cdpSession.send("Page.addScriptToEvaluateOnNewDocument", {
+      source: `
+        const findAndDeleteCdc = () => {
+          for (const key of Object.keys(document)) {
+            if (key.match(/^cdc_|^\$cdc_/)) {
+              delete document[key];
+            }
+          }
+        };
+        findAndDeleteCdc();
+        const observer = new MutationObserver(findAndDeleteCdc);
+        observer.observe(document, { attributes: true, childList: true, subtree: true });
+      `,
+    });
+
+    // ── CDP stealth: realistic user-agent ──
+    await cdpSession.send("Network.setUserAgentOverride", {
+      userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+      acceptLanguage: "en-US,en;q=0.9",
+      platform: "Linux",
+    });
+
+    // ── Proxy authentication via Fetch domain ──
+    try {
+      const _cfg = loadConfig();
+      const _resolved = resolveBrowserConfig(_cfg.browser, _cfg);
+      if (_resolved.proxy?.username) {
+        await cdpSession.send("Fetch.enable", {
+          handleAuthRequests: true,
+          patterns: [{ requestStage: "Request" }, { requestStage: "Response" }],
+        });
+        cdpSession.on("Fetch.authRequired", async (event: Record<string, unknown>) => {
+          try {
+            await cdpSession.send("Fetch.continueWithAuth", {
+              requestId: event.requestId,
+              authChallengeResponse: {
+                response: "ProvideCredentials",
+                username: _resolved.proxy!.username,
+                password: _resolved.proxy!.password || "",
+              },
+            });
+          } catch {
+            // Ignore auth failures
+          }
+        });
+        cdpSession.on("Fetch.requestPaused", async (event: Record<string, unknown>) => {
+          try {
+            await cdpSession.send("Fetch.continueRequest", {
+              requestId: event.requestId,
+            });
+          } catch {
+            // Ignore
+          }
+        });
+        // Don't detach - CDP session must stay alive for proxy auth events
+      } else {
+        await cdpSession.detach().catch(() => {});
+      }
+    } catch {
+      // If config read fails, just detach the session
+      await cdpSession.detach().catch(() => {});
+    }
+  } catch {
+    // Non-critical: page may already be closed
+  }
+}
+
 function observeContext(context: BrowserContext) {
   if (observedContexts.has(context)) {
     return;
@@ -348,8 +424,12 @@ function observeContext(context: BrowserContext) {
 
   for (const page of context.pages()) {
     ensurePageState(page);
+    setupPageCdp(page).catch(() => {});
   }
-  context.on("page", (page) => ensurePageState(page));
+  context.on("page", (page) => {
+    ensurePageState(page);
+    setupPageCdp(page).catch(() => {});
+  });
 }
 
 export function ensureContextState(context: BrowserContext): ContextState {

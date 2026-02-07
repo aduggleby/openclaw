@@ -160,6 +160,85 @@ export async function isChromeCdpReady(
   return await canOpenWebSocket(wsUrl, handshakeTimeoutMs);
 }
 
+
+
+// ── Browser-level proxy authentication ──
+// Connects directly to Chrome's browser WebSocket endpoint and enables
+// Fetch domain to handle proxy auth challenges for ALL targets/pages.
+// This must happen after Chrome starts but before any navigation.
+async function setupBrowserLevelProxyAuth(
+  cdpPort: number,
+  proxy: { url: string; username?: string; password?: string },
+): Promise<void> {
+  if (!proxy.username) return;
+
+  const versionResp = await fetch(`http://127.0.0.1:${cdpPort}/json/version`);
+  const version = (await versionResp.json()) as { webSocketDebuggerUrl?: string };
+  const browserWsUrl = version.webSocketDebuggerUrl;
+  if (!browserWsUrl) return;
+
+  return new Promise<void>((resolve) => {
+    const ws = new WebSocket(browserWsUrl);
+    let msgId = 1;
+
+    ws.addEventListener("open", () => {
+      // Enable Fetch with auth interception at browser level
+      ws.send(JSON.stringify({
+        id: msgId++,
+        method: "Fetch.enable",
+        params: {
+          handleAuthRequests: true,
+          patterns: [{ requestStage: "Request" }],
+        },
+      }));
+    });
+
+    ws.addEventListener("message", (evt) => {
+      const msg = JSON.parse(String(evt.data));
+
+      // Fetch.enable response - setup complete
+      if (msg.id === 1 && !msg.error) {
+        resolve();
+      }
+      if (msg.id === 1 && msg.error) {
+        // Fetch.enable failed at browser level, resolve anyway
+        ws.close();
+        resolve();
+      }
+
+      // Handle proxy auth challenges
+      if (msg.method === "Fetch.authRequired") {
+        ws.send(JSON.stringify({
+          id: msgId++,
+          method: "Fetch.continueWithAuth",
+          params: {
+            requestId: msg.params.requestId,
+            authChallengeResponse: {
+              response: "ProvideCredentials",
+              username: proxy.username,
+              password: proxy.password || "",
+            },
+          },
+        }));
+      }
+
+      // Continue paused requests (non-auth)
+      if (msg.method === "Fetch.requestPaused") {
+        ws.send(JSON.stringify({
+          id: msgId++,
+          method: "Fetch.continueRequest",
+          params: { requestId: msg.params.requestId },
+        }));
+      }
+    });
+
+    ws.addEventListener("error", () => resolve());
+    // Don't close the WebSocket - it needs to stay alive for ongoing auth events
+    // Timeout resolve after 5s in case of issues
+    setTimeout(resolve, 5000);
+  });
+}
+
 export async function launchOpenClawChrome(
   resolved: ResolvedBrowserConfig,
   profile: ResolvedBrowserProfile,
@@ -317,6 +396,16 @@ export async function launchOpenClawChrome(
   log.info(
     `🦞 openclaw browser started (${exe.kind}) profile "${profile.name}" on 127.0.0.1:${profile.cdpPort} (pid ${pid})`,
   );
+
+  // Set up browser-level proxy auth before any pages navigate
+  if (resolved.proxy?.username) {
+    try {
+      await setupBrowserLevelProxyAuth(profile.cdpPort, resolved.proxy);
+      log.info("🦞 browser-level proxy auth configured");
+    } catch {
+      log.warn("browser-level proxy auth setup failed (non-critical)");
+    }
+  }
 
   return {
     pid,
